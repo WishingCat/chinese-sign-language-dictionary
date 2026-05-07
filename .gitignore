@@ -1,0 +1,8 @@
+# source books excluded from repo (copyright)
+DictionaryBook/
+
+# pipeline transient dir
+.epub_work/
+
+# macOS
+.DS_Store
