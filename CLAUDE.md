@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**中国手语词典数据库** — extracts 《国家通用手语词典（全四册）》EPUBs into a single SQLite DB + flat image folder, for consumption by the sibling `signo-web` app.
+**中国手语词典数据库** — extracts 《国家通用手语词典（全四册）》EPUBs into a base SQLite DB + flat image folder, plus a derivative theme-tagged DB with difficulty progression, for consumption by the sibling `signo-web` app.
 
 > This folder is a sub-project of `/Users/wishingcat/Projects/Signo/`. That parent `CLAUDE.md` documents the Next.js app; this one documents only the data pipeline.
 
@@ -12,18 +12,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 sign-language-database/
 ├── DictionaryBook/       ← source: 4 EPUBs (Volume 1–4.epub). Do not modify.
 ├── scripts/
-│   └── extract_epub.py   ← the only pipeline script. Rebuilds everything.
-├── images/               ← 6699 extracted sign images (generated; v{N}_ prefix)
-└── signs.db              ← SQLite output (generated)
+│   ├── extract_epub.py        ← base pipeline: EPUB → signs.db + images/
+│   ├── add_themes.py          ← one-shot tag pass (docx → signs.theme); input docx removed from repo, kept for reference
+│   ├── add_theme_order.py     ← writes `themes` table (difficulty_rank, tier) into sign_themed.db
+│   └── build_progression.py   ← reads sign_themed.db → emits 主题难度进阶.md
+├── images/               ← 6699 extracted sign images (v{N}_ prefixed)
+├── signs.db              ← base DB (signs + meanings)
+├── sign_themed.db        ← derivative: adds signs.theme column + themes table
+└── 主题难度进阶.md        ← generated teaching-order view of sign_themed.db
 ```
 
-## One command to rebuild everything
+## Rebuild commands — one per artifact
 
 ```bash
+# 1. Base extraction (~10s; requires DictionaryBook/Volume {1..4}.epub)
 rm -rf images signs.db && python3 scripts/extract_epub.py
+
+# 2. Difficulty ordering + progression doc (operates on committed sign_themed.db)
+python3 scripts/add_theme_order.py
+python3 scripts/build_progression.py
 ```
 
-Runs end-to-end (~10s): unzips all 4 EPUBs to a temp `.epub_work/`, parses every dictionary xhtml, copies images, builds the DB, cleans up. Idempotent — re-run anytime. Python 3.13 stdlib only (no deps).
+Python 3.13 stdlib only; no deps. The base pipeline is idempotent.
+
+**`sign_themed.db` is a committed snapshot, not a rebuildable artifact.** It was produced by `add_themes.py` from `手语词库主题分类（2025.2）.docx`, which is no longer in the repo. To re-derive tags from scratch, restore that docx at the repo root and run `add_themes.py`.
 
 ## Architecture — how the pipeline thinks about the source
 
@@ -97,6 +109,7 @@ meanings  (…, 结账, NULL, 0) (…, 买单, NULL, 1) (…, 埋单, NULL, 2)
 - Every `signs` row has a real file at `image_path` and a non-empty `description`.
 - Multiple `meanings` sharing the same `sign_id` ⇔ those Chinese words share one sign.
 - `爱国①` vs `爱国②` = **two** `signs` rows (different images), each with one `meanings` row whose `text='爱国'` and distinct `variant_index`.
+- In `sign_themed.db`: every theme name appearing in `signs.theme` (split by `|`) must exist as a row in `themes.name`. `add_theme_order.py` enforces this on write and will refuse to commit if a referenced theme is missing.
 
 ### Common queries
 
@@ -116,11 +129,49 @@ SELECT group_concat(text, '、') AS synonyms, sign_id
 FROM meanings GROUP BY sign_id HAVING COUNT(*) > 1;
 ```
 
+## Derivative DB — `sign_themed.db`
+
+Two additions on top of the base schema; both live in this file only.
+
+### `signs.theme` column (TEXT, indexed)
+
+Pipe-separated list of theme names — e.g. `"生活"` or `"身体|爱心社"`. Currently 1213 of 6699 signs tagged; 52 carry multiple themes. `add_themes.py` wrote these by exact-matching each word in `手语词库主题分类（2025.2）.docx` against `meanings.text`; hit rate was 1243/1292 tokens. No semantic fallback — unmatched words were silently skipped. The tag pass is **not rerunnable in-repo** since the docx is gone; treat the committed `sign_themed.db` as authoritative.
+
+Multi-theme rows mean the sign matched words listed under more than one theme in the docx (e.g. a medical-related sign tagged both `身体` and `爱心社`). App-side, either pre-split on `|` or add a normalized `sign_themes` relation — a plain `JOIN themes ON themes.name = signs.theme` will not match the multi-theme rows.
+
+### `themes` table — difficulty ordering
+
+```
+themes(name TEXT PK, difficulty_rank INTEGER UNIQUE, tier TEXT)
+  -- 31 rows, rank 1..31
+  -- tier ∈ {入门, 初级, 中初, 中级, 中高, 高级, 专项}
+```
+
+**This table is the single source of truth for pedagogical order.** Don't hardcode the ordering anywhere else. `add_theme_order.py` defines the `TIERS` list at the top — to reorder/rename themes, edit that list and rerun it plus `build_progression.py`. Never hand-edit the DB — it'll drift from signs.db and be painful to regenerate.
+
+Typical signo-web consumption:
+
+```sql
+-- Words for a given tier, in progression order
+SELECT t.difficulty_rank, s.theme, m.text, s.image_path
+FROM signs s
+JOIN themes t   ON t.name = s.theme          -- see caveat about multi-theme
+JOIN meanings m ON m.sign_id = s.id
+WHERE t.tier = '入门'
+ORDER BY t.difficulty_rank, s.id, m.order_in_entry;
+```
+
+### `主题难度进阶.md`
+
+Human-readable view only — do not parse it. Regenerated from the DB by `build_progression.py`; every word shown comes from `meanings.text` (not from the docx). Same-sign-different-打法 words get ①② suffixes in the output.
+
 ## Extending
 
 - **Adding another dictionary volume** — drop the EPUB in `DictionaryBook/`, add its number to `VOLUMES` at the top of `extract_epub.py`, rerun. Section detection is auto; no other code changes if its structure matches (single-letter `<h1 class="sect1">` + `<h2 class="sect2">` entries).
 - **Different book with different HTML shape** — write a new parser; do not try to generalize this one. The tight coupling to class names (`sect1`/`sect2`/`picture_figure`/`content`) is intentional.
 - **New dictionary fields** — add a column to `signs` (migration = just rerun; nothing persists between runs). Keep the 3-layer mental model: raw header → signs row → multiple meanings.
+- **Re-order or rename difficulty tiers** — edit `TIERS` in `scripts/add_theme_order.py`, rerun it, then `build_progression.py`. The theme table is rebuilt from scratch each run (`DROP TABLE IF EXISTS`), so it's safe to iterate.
+- **New themes / retag** — requires the source docx (not in repo). Restore it, edit `add_themes.py` if the docx structure changed, rerun against a fresh copy of `signs.db` → `sign_themed.db`, then redo the two theme-order commands.
 
 ## Validation after any parser change
 
@@ -134,3 +185,13 @@ SELECT COUNT(*) FROM meanings WHERE text GLOB '*[①②③④⑤⑥⑦⑧⑨❶�
 ```
 
 The last query is the key canary — if nonzero, either a new glyph set appeared or a new typo case needs a `HEAD_OVERRIDES` entry.
+
+After `add_theme_order.py` (sanity-checks the themed DB):
+
+```bash
+sqlite3 sign_themed.db "
+  SELECT COUNT(*) FROM themes;                         -- expect 31
+  SELECT COUNT(*) FROM signs WHERE theme IS NOT NULL;  -- expect 1213
+  SELECT COUNT(*) FROM signs WHERE theme LIKE '%|%';   -- expect 52 (multi-theme rows)
+"
+```
